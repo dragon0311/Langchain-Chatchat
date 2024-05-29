@@ -427,10 +427,9 @@ def api_address() -> str:
 
     host = API_SERVER["host"]
     if host == "0.0.0.0":
-        host = "127.0.0.1"
+        host = "172.18.208.83"
     port = API_SERVER["port"]
     return f"http://{host}:{port}"
-
 
 def webui_address() -> str:
     from configs.server_config import WEBUI_SERVER

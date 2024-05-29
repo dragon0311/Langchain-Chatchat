@@ -86,7 +86,7 @@ async def knowledge_base_chat(query: str = Body(..., description="用户输入",
 
         # 加入reranker
         if USE_RERANKER:
-            reranker_model_path = MODEL_PATH["reranker"].get(RERANKER_MODEL,"BAAI/bge-reranker-large")
+            reranker_model_path = MODEL_PATH["reranker"].get(RERANKER_MODEL,"D:/code/ai/model/bge-reranker-large")
             print("-----------------model path------------------")
             print(reranker_model_path)
             reranker_model = LangchainReranker(top_n=top_k,
@@ -110,6 +110,7 @@ async def knowledge_base_chat(query: str = Body(..., description="用户输入",
             [i.to_msg_template() for i in history] + [input_msg])
 
         chain = LLMChain(prompt=chat_prompt, llm=model)
+        # chain = FlareChain.from_llm(llm=model, max_generation_len=1000)
 
         # Begin a task that runs in the background.
         task = asyncio.create_task(wrap_done(
@@ -123,7 +124,7 @@ async def knowledge_base_chat(query: str = Body(..., description="用户输入",
             parameters = urlencode({"knowledge_base_name": knowledge_base_name, "file_name": filename})
             base_url = request.base_url
             url = f"{base_url}knowledge_base/download_doc?" + parameters
-            text = f"""出处 [{inum + 1}] [{filename}]({url}) \n\n{doc.page_content}\n\n"""
+            text = f"""出处 [{inum + 1}] [{filename}]({url}) \n\n{doc.page_content}\n\n 匹配分数：{doc.score}"""
             source_documents.append(text)
 
         if len(source_documents) == 0:  # 没有找到相关文档
