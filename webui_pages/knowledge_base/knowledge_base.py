@@ -325,6 +325,7 @@ def knowledge_base_page(api: ApiRequest, is_lite: bool = None):
         if selected_rows:
             file_name = selected_rows[0]["file_name"]
             docs = api.search_kb_docs(knowledge_base_name=selected_kb, file_name=file_name)
+            print("----docs:", docs)
             data = [
                 {"seq": i + 1, "id": x["id"], "page_content": x["page_content"], "source": x["metadata"].get("source"),
                  "type": x["type"],

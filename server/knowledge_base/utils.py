@@ -21,6 +21,17 @@ import json
 from typing import List, Union,Dict, Tuple, Generator
 import chardet
 
+# Load model directly
+from transformers import AutoModel
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from server.utils import get_ChatOpenAI
+from langchain.storage import InMemoryStore
+from langchain.retrievers.multi_vector import MultiVectorRetriever
+from langchain.schema.runnable import RunnableLambda, RunnablePassthrough
+import uuid
 
 def validate_kb_name(knowledge_base_id: str) -> bool:
     # 检查是否包含预期外的字符或路径攻击关键字
@@ -267,6 +278,178 @@ def make_text_splitter(
     # text_splitter._tokenizer.prefer_gpu()
     return text_splitter
 
+def create_multi_vector_retriever(vectorstore, text_summaries, texts):
+    """
+    Create retriever that indexes summaries, but returns raw images or texts
+    """
+
+    # Initialize the storage layer    
+    store = InMemoryStore()
+    id_key = "doc_id"
+
+    # Create the multi-vector retriever
+    retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        id_key=id_key,
+    )
+
+    # Helper function to add documents to the vectorstore and docstore
+    def add_documents(retriever, doc_summaries, doc_contents):
+        doc_ids = [str(uuid.uuid4()) for _ in doc_contents]
+        summary_docs = [
+            Document(page_content=s, metadata={id_key: doc_ids[i]})
+            for i, s in enumerate(doc_summaries)
+        ]
+        retriever.vectorstore.add_documents(summary_docs)
+        retriever.docstore.mset(list(zip(doc_ids, doc_contents)))
+
+    # Add texts, tables, and images
+    add_documents(retriever, text_summaries, texts)
+    return retriever
+
+def generate_doc_summary(file):
+    """
+    Create a doc summary
+    """
+
+    # Prompt
+    prompt_text = """You are an assistant tasked extracting two attributes \
+    from financial documents. (1) Tell me the company that the document is \
+    focused on. (2) Look at any tables in the document and tell me the units \ 
+    of the table. Many table will have '(In thousands)' or '(in millions)' prior \
+    to the table text. Provide these two for the document: \n\n {document} """
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+
+    # Text summary chain
+    model = AutoModel.from_pretrained("microsoft/layoutlmv3-base")
+    # model = ChatOpenAI(temperature=0, model="gpt-4-1106-preview")
+    summarize_chain = {"document": lambda x: x} | prompt | model | StrOutputParser()
+
+    # Load doc
+    loader = PyPDFLoader(file)
+    pdf_pages = loader.load()
+    texts = [t.page_content for t in pdf_pages]
+    text_string = " ".join(texts)
+    summary = summarize_chain.invoke({"document": text_string})
+    return summary
+
+def generate_table_summaries(texts):
+    """
+    Summarize text elements
+    texts: List of str
+    """
+
+    # Prompt
+    prompt_text = """You are an assistant tasked with summarizing tables within a provided text chunk. \
+    If the text chunk contains tables, then give a brief summary of the table and list the row and column \
+    names to identify what is captured in the table. Do not sumnmarize quantitative results in the table. \ 
+    If there is no table present, then just return "No table". \n\n Text: {element} """
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+
+    # Text summary chain
+    # model = ChatOpenAI(temperature=0, model="gpt-4")
+    model = get_ChatOpenAI(
+        model_name=LLM_MODELS[0],
+        temperature=0.7,
+    )    
+    summarize_chain = {"element": lambda x: x} | prompt | model | StrOutputParser()
+
+    # Initialize empty summaries
+    text_summaries = []
+    text_summaries = summarize_chain.batch(texts, {"max_concurrency": 5})
+
+    return text_summaries
+
+def load_and_split(file, token_count, chunk_overlap, split_document=True):
+    """
+    Load and optionally split PDF files.
+
+    Args:
+        file (str): File path.
+        token_count (int): Token count for splitting.
+        split_document (bool): Flag for splitting or returning pages.
+    """
+
+    loader = PyPDFLoader(file)
+    pdf_pages = loader.load()
+
+    if split_document:
+        text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            chunk_size=token_count, chunk_overlap=chunk_overlap
+        )
+
+        docs = text_splitter.split_documents(pdf_pages)
+        texts = [d.page_content for d in docs]
+    else:
+        texts = [d.page_content for d in pdf_pages]
+
+    print(f"There are {len(texts)} text elements")
+    return texts
+
+def prepare_documents(docs):
+    """
+    Prepare documents for prompt. Concatenates Document objects (after extracting their page_content)
+    and strings into a single string, separated by two newlines.
+
+    :param docs: A list of str or Document objects.
+    :return: A single string containing all documents.
+    """
+    # Process each document and append it to the list
+    processed_docs = [
+        doc.page_content if isinstance(doc, Document) else doc for doc in docs
+    ]
+
+    # Join all processed documents into a single string
+    return "\n\n".join(processed_docs)
+
+def rag_chain(retriever):
+    """
+    RAG chain.
+
+    Args:
+        retriever: The retriever to use.
+    """
+
+    # Prompt template
+    template = """Answer the question based only on the following context, which can include text and tables:
+    {context}
+    Question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+
+    # LLM
+    model = get_ChatOpenAI(
+        model_name=LLM_MODELS[0],
+        temperature=0.7,
+    )    
+    # RAG pipeline
+    chain = (
+        {
+            "context": retriever | RunnableLambda(prepare_documents),
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | model
+        | StrOutputParser()
+    )
+    return chain
+
+
+def load_file(file, token_count, split_document):
+    """
+    Load file.
+
+    Args:
+        file (str): file name.
+        dir (str): Directory path.
+        token_count (int): Token count for splitting.
+        split_document (bool): Flag for splitting documents.
+    """
+    docs_summary = generate_doc_summary(file)
+    texts = load_and_split(file, token_count, split_document)
+    
+    return texts, docs_summary
 
 class KnowledgeFile:
     def __init__(
@@ -337,6 +520,44 @@ class KnowledgeFile:
             chunk_overlap: int = OVERLAP_SIZE,
             text_splitter: TextSplitter = None,
     ):
+        if self.filename.endswith(".pdf"):
+             # Get texts and doc summary
+            doc_texts, doc_summary = load_file(self.filepath, chunk_size, True)
+
+            # Get table summaries
+            doc_table_summaries = generate_table_summaries(doc_texts)
+
+            # Add doc summary to table summary to preserve context
+            doc_text_summaries = [
+                "Here is a summary of the doc: \n\n"
+                + doc_summary
+                + "\n\n Here is a summary of a table within this doc: \n\n"
+                + t
+                for t in doc_table_summaries
+            ]
+
+            # The vectorstore to use to index the summaries
+            vectorstore = Chroma(collection_name=expt, embedding_function=OpenAIEmbeddings())
+
+            # Create our table retriever
+            table_retriever = create_multi_vector_retriever(
+                vectorstore, doc_table_summaries, doc_texts
+            )
+
+            # Create our docs retriever
+            vectorstore_docs = Chroma.from_texts(
+                texts=doc_texts, collection_name=expt + "docs", embedding=OpenAIEmbeddings()
+            )
+            docs_retriever = vectorstore_docs.as_retriever()
+
+            # Initialize ensemble retriever
+            ensemble_retriever = EnsembleRetriever(
+                retrievers=[table_retriever, docs_retriever], weights=[0.75, 0.25]
+            )
+
+            # Chain
+            stor_chain[expt] = rag_chain(ensemble_retriever)
+            
         if self.splited_docs is None or refresh:
             docs = self.file2docs()
             self.splited_docs = self.docs2texts(docs=docs,
